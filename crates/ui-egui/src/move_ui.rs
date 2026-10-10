@@ -88,7 +88,7 @@ impl MovePreview {
 }
 
 /// The whole-pixel offset of the current Move drag on document `idx`, if one is under way.
-fn drag_offset(app: &PhotocraftApp) -> Option<(i32, i32)> {
+pub(crate) fn drag_offset(app: &PhotocraftApp) -> Option<(i32, i32)> {
     let d = app.drag.as_ref().filter(|d| d.tool == Tool::Move)?;
     let end = d.points.last().map_or(d.start, |p| [p[0], p[1]]);
     let dx = (end[0] - d.start[0]).round().clamp(-1e7, 1e7) as i32;

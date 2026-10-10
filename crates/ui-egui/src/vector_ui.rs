@@ -42,15 +42,30 @@ fn hex(c: [f32; 4]) -> String {
     format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
 }
 
-fn stroke_param(app: &PhotocraftApp) -> Value {
+/// The stroke width a shape gets when a stroke colour is picked while it has none (as in Properties).
+const NEW_STROKE_WIDTH: f32 = 3.0;
+
+/// The colour new shapes are filled with: the one picked in the options bar, else the foreground.
+fn fill_color(app: &PhotocraftApp) -> [f32; 4] {
+    app.ui.tool_options.shape_fill_color.unwrap_or(app.session.tools.foreground)
+}
+
+fn solid(c: [f32; 4]) -> photocraft_doc::Fill {
+    photocraft_doc::Fill::Solid(photocraft_doc::Color::rgba(c[0], c[1], c[2], c[3]))
+}
+
+/// The options bar's stroke defaults as `shape.create` / `shape.edit` stroke params of `width`.
+fn default_stroke_params(app: &PhotocraftApp, width: f32) -> Value {
     let o = &app.ui.tool_options;
-    if o.stroke_width <= 0.0 {
-        return Value::Null;
-    }
     let mut p = o.shape_stroke.params();
-    p["width"] = json!(o.stroke_width);
-    p["color"] = json!(hex(app.session.tools.background));
+    p["width"] = json!(width);
+    p["color"] = json!(hex(o.shape_stroke_color));
     p
+}
+
+fn stroke_param(app: &PhotocraftApp) -> Value {
+    let width = app.ui.tool_options.stroke_width;
+    if width <= 0.0 { Value::Null } else { default_stroke_params(app, width) }
 }
 
 /// Geometry of a Shape-tool drag as `shape.create` params, without fill and stroke (None when too
@@ -107,8 +122,9 @@ pub fn finish_shape(app: &mut PhotocraftApp, tool: Tool, start: [f64; 2], end: [
     }
 }
 
-fn fill_param(app: &PhotocraftApp) -> Value {
-    if app.ui.tool_options.shape_fill { json!(hex(app.session.tools.foreground)) } else { Value::Null }
+/// The options bar's fill as a `shape.create` param: a colour, or null for No Color.
+pub(crate) fn fill_param(app: &PhotocraftApp) -> Value {
+    if app.ui.tool_options.shape_fill { json!(hex(fill_color(app))) } else { Value::Null }
 }
 
 /// Create a shape layer from `shape.create` geometry with the options bar's fill and stroke: the
@@ -133,13 +149,13 @@ pub fn draw_shape_preview(app: &PhotocraftApp, painter: &egui::Painter, xf: &Vie
         path
     };
     // ponytail: preview colours skip the canvas's colour management; the commit renders them exactly.
-    let fill = if o.shape_fill { rgb32(app.session.tools.foreground) } else { Color32::TRANSPARENT };
+    let fill = if o.shape_fill { rgb32(fill_color(app)) } else { Color32::TRANSPARENT };
     {
         let origin = xf.to_screen(0.0, 0.0);
         let x = xf.to_screen(1.0, 0.0) - origin;
         let y = xf.to_screen(0.0, 1.0) - origin;
         let transform = Affine { m: [x.x as f64, x.y as f64, y.x as f64, y.y as f64, origin.x as f64, origin.y as f64] };
-        let c = app.session.tools.background;
+        let c = o.shape_stroke_color;
         let shape = photocraft_doc::ShapeLayer {
             path: path.transform(&transform),
             fill: (fill != Color32::TRANSPARENT).then(|| {
@@ -242,14 +258,12 @@ pub fn pen_commit(app: &mut PhotocraftApp, closed: bool) {
     }
     let path = pen_to_json(&pen, closed);
     let r = if app.ui.tool_options.vector_mode == "shape" {
-        let fill = if closed && app.ui.tool_options.shape_fill { json!(hex(app.session.tools.foreground)) } else { Value::Null };
+        let fill = if closed { fill_param(app) } else { Value::Null };
         let stroke = if closed {
             stroke_param(app)
         } else {
-            let mut stroke = app.ui.tool_options.shape_stroke.params();
-            stroke["width"] = json!(app.ui.tool_options.stroke_width.max(1.0));
-            stroke["color"] = json!(hex(app.session.tools.foreground));
-            stroke
+            // An open path is only its stroke: it always gets one.
+            default_stroke_params(app, app.ui.tool_options.stroke_width.max(1.0))
         };
         app.run("shape.create", json!({"kind": "path", "path": path, "fill": fill, "stroke": stroke}))
     } else if let Some((id, existing)) = targeted_vector_mask(app) {
@@ -542,6 +556,19 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
     let lbl = |ui: &mut egui::Ui, s: &str| {
         ui.label(egui::RichText::new(s).color(t.text_dim).size(12.0));
     };
+    if matches!(tool, Tool::PathSelection | Tool::DirectSelection) && selected_shape(app).is_some() {
+        // As in Photoshop, the selection tools edit the selected shape's Fill and Stroke too.
+        fill_stroke_controls(app, ui, tool);
+        crate::widgets::vline(ui, 22.0);
+    }
+    if tool == Tool::Pen && app.ui.tool_options.vector_mode == "shape" {
+        let mut mode = app.ui.tool_options.vector_mode.clone();
+        let opts = [("path".to_string(), tl!("Path")), ("shape".to_string(), tl!("Shape"))];
+        crate::widgets::dropdown(ui, "pen-mode", &mut mode, &opts, 80.0);
+        crate::widgets::vline(ui, 22.0);
+        fill_stroke_controls(app, ui, tool);
+        app.ui.tool_options.vector_mode = mode;
+    }
     let o = &mut app.ui.tool_options;
     if tool == Tool::PathSelection {
         lbl(ui, if app.ui.vector_mask_target { "Drag to move the targeted vector mask" } else { tl!("Drag to move the active shape's path or the Work Path") });
@@ -559,14 +586,10 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
         return true;
     }
     if tool == Tool::Pen {
-        let opts = [("path".to_string(), tl!("Path")), ("shape".to_string(), tl!("Shape"))];
-        crate::widgets::dropdown(ui, "pen-mode", &mut o.vector_mode, &opts, 80.0);
-        crate::widgets::vline(ui, 22.0);
-        if o.vector_mode == "shape" {
-            crate::widgets::value_field(ui, &mut o.stroke_width, 0.0..=288.0, "px", 58.0);
-            if let Some(style) = crate::shape_stroke_ui::button(ui, "pen-stroke", &o.shape_stroke, &mut app.ui.stroke_editor, false, true, None) {
-                o.shape_stroke = style;
-            }
+        if o.vector_mode != "shape" {
+            let opts = [("path".to_string(), tl!("Path")), ("shape".to_string(), tl!("Shape"))];
+            crate::widgets::dropdown(ui, "pen-mode", &mut o.vector_mode, &opts, 80.0);
+            crate::widgets::vline(ui, 22.0);
         }
         lbl(
             ui,
@@ -580,18 +603,8 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
     let mut mode = "shape".to_string();
     crate::widgets::dropdown(ui, "shape-mode", &mut mode, &[("shape".to_string(), tl!("Shape"))], 80.0);
     crate::widgets::vline(ui, 22.0);
-    lbl(ui, tl!("Fill:"));
-    crate::widgets::checkbox(ui, &mut o.shape_fill, "");
-    let (r, _) = ui.allocate_exact_size(vec2(22.0, 16.0), Sense::hover());
-    ui.painter().rect_filled(r, 2.0, rgb32(app.session.tools.foreground));
-    ui.painter().rect_stroke(r, 2.0, Stroke::new(1.0, t.field_border), egui::StrokeKind::Outside);
-    lbl(ui, tl!("Stroke:"));
-    let bg = app.session.tools.background;
-    let stroke_color = swatch(ui, Some(&photocraft_doc::Fill::Solid(photocraft_doc::Color::rgba(bg[0], bg[1], bg[2], bg[3]))), tl!("Stroke color"));
-    crate::widgets::value_field(ui, &mut o.stroke_width, 0.0..=288.0, "px", 58.0);
-    if let Some(style) = crate::shape_stroke_ui::button(ui, "tool-stroke", &o.shape_stroke, &mut app.ui.stroke_editor, true, tool != Tool::EllipseShape, None) {
-        o.shape_stroke = style;
-    }
+    fill_stroke_controls(app, ui, tool);
+    let o = &mut app.ui.tool_options;
     match tool {
         Tool::Rectangle => {
             crate::widgets::vline(ui, 22.0);
@@ -617,15 +630,149 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
         }
         _ => {}
     }
-    if let Some(color) = stroke_color {
-        if color == "none" {
-            app.ui.tool_options.stroke_width = 0.0;
-        } else if let Err(e) = app.run("tools.setColors", json!({"background": color})) {
-            app.ui.status = e;
-            app.ui.status_error = true;
-        }
-    }
     true
+}
+
+/// What the options bar shows and edits of the selected shape layer.
+struct SelectedShape {
+    id: photocraft_doc::LayerId,
+    fill: Option<photocraft_doc::Fill>,
+    stroke: Option<photocraft_doc::ShapeStroke>,
+    closed: bool,
+    ellipse: bool,
+}
+
+/// The selected shape layer, whose Fill and Stroke the options bar edits.
+fn selected_shape(app: &PhotocraftApp) -> Option<SelectedShape> {
+    let st = app.session.active()?;
+    let l = st.active_layer.and_then(|id| st.doc.layer(id))?;
+    let LayerContent::Shape(sh) = &l.content else { return None };
+    Some(SelectedShape {
+        id: l.id,
+        fill: sh.fill.clone(),
+        stroke: sh.stroke.clone(),
+        closed: sh.path.subpaths.iter().all(|s| s.closed),
+        ellipse: matches!(sh.live, Some(photocraft_doc::LiveShape::Ellipse { .. })),
+    })
+}
+
+/// The options bar's Fill and Stroke: the options for the next shape and the selected shape's.
+fn bar_look(app: &PhotocraftApp, target: Option<&SelectedShape>) -> (Option<photocraft_doc::Fill>, Option<photocraft_doc::ShapeStroke>) {
+    if let Some(s) = target {
+        return (s.fill.clone(), s.stroke.clone());
+    }
+    let o = &app.ui.tool_options;
+    let stroke = (o.stroke_width > 0.0).then(|| o.shape_stroke.stroke(o.stroke_width, solid(o.shape_stroke_color)));
+    (o.shape_fill.then(|| solid(fill_color(app))), stroke)
+}
+
+/// One change in the options bar's Fill and Stroke (colours as `#rrggbb` or "none").
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum BarEdit {
+    Fill(String),
+    StrokeColor(String),
+    StrokeWidth(f32),
+    StrokeStyle(crate::shape_stroke_ui::StrokeOptions),
+}
+
+/// The options bar's Fill and Stroke, editable at any time. With a shape layer selected they show
+/// and edit that layer (`shape.edit`), as in Photoshop; either way they set what the next shape
+/// gets. Picking a colour never changes the Foreground or Background colour.
+fn fill_stroke_controls(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) {
+    let t = Tokens::get(ui.ctx());
+    let lbl = |ui: &mut egui::Ui, s: &str| {
+        ui.label(egui::RichText::new(s).color(t.text_dim).size(12.0));
+    };
+    let target = selected_shape(app);
+    let (fill, stroke) = bar_look(app, target.as_ref());
+    let mut edit = None;
+    lbl(ui, tl!("Fill:"));
+    if let Some(c) = swatch(ui, fill.as_ref(), tl!("Set shape fill type")) {
+        edit = Some(BarEdit::Fill(c));
+    }
+    lbl(ui, tl!("Stroke:"));
+    if let Some(c) = swatch(ui, stroke.as_ref().map(|s| &s.paint), tl!("Set shape stroke type")) {
+        edit = Some(BarEdit::StrokeColor(c));
+    }
+    let mut w = stroke.as_ref().map_or(0.0, |s| s.width);
+    if crate::widgets::value_field(ui, &mut w, 0.0..=288.0, "px", 58.0).changed() {
+        edit = Some(BarEdit::StrokeWidth(w));
+    }
+    let style = stroke.as_ref().map_or_else(|| app.ui.tool_options.shape_stroke.clone(), crate::shape_stroke_ui::StrokeOptions::from);
+    let closed = target.as_ref().map_or(tool != Tool::Pen, |s| s.closed);
+    let corners = target.as_ref().map_or(tool != Tool::EllipseShape, |s| !s.ellipse);
+    let doc_id = app.session.active().map(|st| st.doc.id);
+    let preview = target.as_ref().filter(|s| s.stroke.is_some()).and_then(|s| doc_id.map(|d| (d, s.id)));
+    let style_key = target.as_ref().map_or_else(|| "tool-stroke".to_string(), |s| format!("bar-style-{doc_id:?}-{}", s.id.0));
+    if let Some(next) = crate::shape_stroke_ui::button(ui, &style_key, &style, &mut app.ui.stroke_editor, closed, corners, preview) {
+        edit = Some(BarEdit::StrokeStyle(next));
+    }
+    if let Some(edit) = edit
+        && let Err(e) = apply_bar_edit(app, edit)
+    {
+        app.ui.status = e;
+        app.ui.status_error = true;
+    }
+}
+
+/// Apply an options-bar Fill/Stroke change: it becomes the next shape's, and the selected shape
+/// layer's too (one coalesced history step per control while dragging a picker or a value).
+pub(crate) fn apply_bar_edit(app: &mut PhotocraftApp, edit: BarEdit) -> Result<(), String> {
+    let target = selected_shape(app);
+    let (_, stroke) = bar_look(app, target.as_ref());
+    let doc_id = app.session.active().map(|st| st.doc.id);
+    let key = |k: &str| json!(format!("shape-{doc_id:?}-{}-{k}", target.as_ref().map_or(0, |s| s.id.0)));
+    let rgba = |c: &str| crate::color_picker_ui::parse_hex(c).map(|[r, g, b]| [r, g, b, 1.0]);
+    let o = &mut app.ui.tool_options;
+    let params = match edit {
+        BarEdit::Fill(c) if c == "none" => {
+            o.shape_fill = false;
+            json!({"fill": null})
+        }
+        BarEdit::Fill(c) => {
+            let color = rgba(&c).ok_or_else(|| format!("not a colour: {c}"))?;
+            (o.shape_fill, o.shape_fill_color) = (true, Some(color));
+            json!({"fill": c, "coalesce": key("fill")})
+        }
+        BarEdit::StrokeColor(c) if c == "none" => {
+            o.stroke_width = 0.0;
+            json!({"stroke": null})
+        }
+        BarEdit::StrokeColor(c) => {
+            o.shape_stroke_color = rgba(&c).ok_or_else(|| format!("not a colour: {c}"))?;
+            if o.stroke_width <= 0.0 {
+                o.stroke_width = stroke.as_ref().map_or(NEW_STROKE_WIDTH, |s| s.width);
+            }
+            // A shape without a stroke gets the whole default stroke; one with a stroke keeps its
+            // width and style.
+            let p = if stroke.is_some() { json!({"color": c}) } else { default_stroke_params(app, app.ui.tool_options.stroke_width) };
+            json!({"stroke": p, "coalesce": key("stroke")})
+        }
+        BarEdit::StrokeWidth(w) => {
+            let w = if w.is_finite() { w.clamp(0.0, 288.0) } else { 0.0 };
+            o.stroke_width = w;
+            if w <= 0.0 {
+                json!({"stroke": null})
+            } else if stroke.is_some() {
+                json!({"stroke": {"width": w}, "coalesce": key("stroke-w")})
+            } else {
+                json!({"stroke": default_stroke_params(app, w), "coalesce": key("stroke-w")})
+            }
+        }
+        BarEdit::StrokeStyle(next) => {
+            let p = json!({"stroke": next.params()});
+            o.shape_stroke = next;
+            // Without a stroke the style waits for the next one.
+            if stroke.is_none() {
+                return Ok(());
+            }
+            p
+        }
+    };
+    let Some(target) = target else { return Ok(()) };
+    let mut params = params;
+    params["layer"] = json!(target.id.0);
+    app.run("shape.edit", params).map(|_| ())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1110,6 +1257,95 @@ mod tests {
             assert_eq!(open["stroke"]["dashes"], info["stroke"]["dashes"]);
             assert_eq!(open["path"]["subpaths"][0]["closed"], false);
         }
+    }
+
+    /// The options bar's Fill and Stroke edit the selected shape layer, as in Photoshop, and
+    /// never touch the Foreground/Background colours.
+    #[test]
+    fn options_bar_fill_and_stroke_edit_the_selected_shape() {
+        let mut a = app();
+        a.run("tools.setColors", json!({"foreground": "#ff0000", "background": "#00ff00"})).unwrap();
+        finish_shape(&mut a, Tool::Rectangle, [20.0, 20.0], [120.0, 100.0], Default::default());
+        let info = |a: &mut PhotocraftApp| a.run("shape.info", json!({})).unwrap();
+        assert_eq!(info(&mut a)["fill"], "#ff0000");
+        assert!(info(&mut a)["stroke"].is_null());
+        let past = |a: &PhotocraftApp| a.session.active().unwrap().history.past_len();
+        let history = past(&a);
+
+        // Dragging in the fill picker is one history step.
+        apply_bar_edit(&mut a, BarEdit::Fill("#0000ff".into())).unwrap();
+        apply_bar_edit(&mut a, BarEdit::Fill("#0000fe".into())).unwrap();
+        assert_eq!(info(&mut a)["fill"], "#0000fe");
+        assert_eq!(past(&a), history + 1);
+
+        // A stroke colour on a shape without one gives it the default stroke.
+        apply_bar_edit(&mut a, BarEdit::StrokeColor("#ffff00".into())).unwrap();
+        let stroke = info(&mut a)["stroke"].clone();
+        assert_eq!((stroke["fill"].clone(), stroke["width"].clone()), (json!("#ffff00"), json!(NEW_STROKE_WIDTH)));
+        apply_bar_edit(&mut a, BarEdit::StrokeWidth(8.0)).unwrap();
+        let stroke = info(&mut a)["stroke"].clone();
+        assert_eq!((stroke["fill"].clone(), stroke["width"].clone()), (json!("#ffff00"), json!(8.0)));
+        let dashed = crate::shape_stroke_ui::StrokeOptions { dashes: vec![4.0, 2.0], ..Default::default() };
+        apply_bar_edit(&mut a, BarEdit::StrokeStyle(dashed)).unwrap();
+        assert_eq!(info(&mut a)["stroke"]["dashes"], json!([4.0, 2.0]));
+        assert_eq!(info(&mut a)["stroke"]["width"], 8.0);
+
+        // No Color removes either.
+        apply_bar_edit(&mut a, BarEdit::StrokeColor("none".into())).unwrap();
+        apply_bar_edit(&mut a, BarEdit::Fill("none".into())).unwrap();
+        assert!(info(&mut a)["stroke"].is_null() && info(&mut a)["fill"].is_null());
+        // Width typed into a shape without a stroke adds one.
+        apply_bar_edit(&mut a, BarEdit::StrokeWidth(2.0)).unwrap();
+        assert_eq!(info(&mut a)["stroke"]["width"], 2.0);
+        assert_eq!(info(&mut a)["stroke"]["fill"], "#ffff00");
+
+        assert_eq!(a.session.tools.foreground, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(a.session.tools.background, [0.0, 1.0, 0.0, 1.0]);
+    }
+
+    /// Without a shape layer selected the bar sets what the next shape gets, without history.
+    #[test]
+    fn options_bar_fill_and_stroke_set_the_next_shape() {
+        let mut a = app();
+        a.run("layer.new", json!({})).unwrap();
+        let history = a.session.active().unwrap().history.past_len();
+        apply_bar_edit(&mut a, BarEdit::Fill("#123456".into())).unwrap();
+        apply_bar_edit(&mut a, BarEdit::StrokeColor("#abcdef".into())).unwrap();
+        apply_bar_edit(&mut a, BarEdit::StrokeWidth(4.0)).unwrap();
+        assert_eq!(a.session.active().unwrap().history.past_len(), history);
+        for tool in [Tool::EllipseShape, Tool::CustomShape] {
+            finish_shape(&mut a, tool, [10.0, 10.0], [90.0, 90.0], Default::default());
+            let info = a.run("shape.info", json!({})).unwrap();
+            assert_eq!(info["fill"], "#123456", "{tool:?}");
+            assert_eq!((info["stroke"]["fill"].clone(), info["stroke"]["width"].clone()), (json!("#abcdef"), json!(4.0)), "{tool:?}");
+            a.run("layer.new", json!({})).unwrap();
+        }
+        apply_bar_edit(&mut a, BarEdit::Fill("none".into())).unwrap();
+        finish_shape(&mut a, Tool::Rectangle, [10.0, 10.0], [90.0, 90.0], Default::default());
+        assert!(a.run("shape.info", json!({})).unwrap()["fill"].is_null());
+    }
+
+    #[test]
+    fn options_bar_rejects_bad_input_without_panicking() {
+        let mut a = app();
+        finish_shape(&mut a, Tool::Rectangle, [20.0, 20.0], [120.0, 100.0], Default::default());
+        let before = a.run("shape.info", json!({})).unwrap();
+        assert!(apply_bar_edit(&mut a, BarEdit::Fill("#zz".into())).is_err());
+        assert!(apply_bar_edit(&mut a, BarEdit::StrokeColor("é".into())).is_err());
+        for w in [f32::NAN, f32::INFINITY, -5.0, 1e9] {
+            let _ = apply_bar_edit(&mut a, BarEdit::StrokeWidth(w));
+        }
+        assert_eq!(a.run("shape.info", json!({})).unwrap()["fill"], before["fill"]);
+        // A locked shape reports the lock instead of changing.
+        a.session
+            .edit("lock", |doc, active| {
+                doc.layer_mut(active.unwrap()).unwrap().locks.all = true;
+                Ok(())
+            })
+            .unwrap();
+        let locked = a.run("shape.info", json!({})).unwrap();
+        assert!(apply_bar_edit(&mut a, BarEdit::Fill("#00ff00".into())).is_err());
+        assert_eq!(a.run("shape.info", json!({})).unwrap(), locked);
     }
 
     fn app() -> PhotocraftApp {

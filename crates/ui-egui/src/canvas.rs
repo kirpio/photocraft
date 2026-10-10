@@ -3530,9 +3530,10 @@ pub(crate) fn layer_edges_rect(app: &PhotocraftApp, idx: usize) -> Option<photoc
     Some(b.translate(dx, dy))
 }
 
-/// Move tool › Show Transform Controls: the active layer's transform bounds.
+/// Move tool › Show Transform Controls: the active layer's transform bounds. While the layers are
+/// dragged the box rides along with them, in lockstep with the pixels drawn, as in Photoshop.
 fn transform_controls_rect(app: &PhotocraftApp, xf: &ViewXform) -> Option<Rect> {
-    if app.ui.tool != Tool::Move || !app.ui.tool_options.move_show_transform || app.ui.transform.is_some() || app.drag.is_some() {
+    if app.ui.tool != Tool::Move || !app.ui.tool_options.move_show_transform || app.ui.transform.is_some() {
         return None;
     }
     let st = app.session.active()?;
@@ -3540,11 +3541,28 @@ fn transform_controls_rect(app: &PhotocraftApp, xf: &ViewXform) -> Option<Rect> 
     if crate::doc_props_ui::is_background(&st.doc, l) {
         return None;
     }
+    let (dx, dy) = match &app.drag {
+        None => (0, 0),
+        Some(d) if d.tool == Tool::Move && d.sel_move.is_none() => {
+            let pending = crate::move_ui::drag_offset(app)?;
+            match crate::move_ui::shown_offset(app, st.doc.id, st.revision, l.id) {
+                Some(shown) => shown,
+                // Before the first moved frame, or with Preferences › Show bounding box when
+                // dragging layer (which draws the box instead of the moving pixels).
+                None if pending == (0, 0) || app.session.prefs().interface.show_bounding_box_when_dragging_layer => pending,
+                // Locked layers don't follow: the drag shows its arrow.
+                None => return None,
+            }
+        }
+        // A selection drag shows its own ants.
+        Some(_) => return None,
+    };
     let b = photocraft_engine::transform_cmds::transform_bounds(&st.doc, l);
     if b.is_empty() {
         return None;
     }
-    Some(Rect::from_two_pos(xf.to_screen(b.x0 as f32, b.y0 as f32), xf.to_screen(b.x1 as f32, b.y1 as f32)))
+    let (dx, dy) = (dx as f32, dy as f32);
+    Some(Rect::from_two_pos(xf.to_screen(b.x0 as f32 + dx, b.y0 as f32 + dy), xf.to_screen(b.x1 as f32 + dx, b.y1 as f32 + dy)))
 }
 
 /// A visible handle starts scaling; the narrow band just outside the box starts rotation.
@@ -5981,6 +5999,29 @@ mod transform_controls_tests {
         assert!(!begin_transform_controls_at(&mut app, &ctx, &xf, r.right_bottom()));
         assert!(app.ui.transform.is_none());
         assert_eq!(errors(&app), [crate::transform_tool::LOCKED]);
+    }
+
+    /// The Move tool's transform box rides along with the dragged layer instead of vanishing.
+    #[test]
+    fn move_transform_controls_follow_the_drag() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.session.execute("file.new", json!({"width": 200, "height": 200})).unwrap();
+        app.session.execute("shape.create", json!({"kind": "rect", "rect": [20, 30, 80, 40], "fill": "#ff0000"})).unwrap();
+        app.sync_views();
+        app.ui.tool = Tool::Move;
+        app.ui.tool_options.move_show_transform = true;
+        let xf = ViewXform { rect: Rect::from_min_size(Pos2::ZERO, vec2(200.0, 200.0)), zoom: 1.0, center: [100.0, 100.0], flip: false, rotation: 0.0 };
+        let still = transform_controls_rect(&app, &xf).unwrap();
+
+        app.drag = Some(Drag::new(Tool::Move, [30.0, 40.0], vec![[30.0, 40.0, 1.0]], Default::default(), false));
+        assert_eq!(transform_controls_rect(&app, &xf), Some(still), "shown as the press starts");
+        app.drag.as_mut().unwrap().points.push([55.0, 50.0, 1.0]);
+        assert!(crate::move_ui::display_doc(&mut app, 0).is_some(), "the layer follows the pointer");
+        assert_eq!(transform_controls_rect(&app, &xf), Some(still.translate(vec2(25.0, 10.0))));
+
+        // Other drags (a marquee, say) still hide it.
+        app.drag = Some(Drag::new(Tool::RectMarquee, [30.0, 40.0], vec![[30.0, 40.0, 1.0], [55.0, 50.0, 1.0]], Default::default(), false));
+        assert_eq!(transform_controls_rect(&app, &xf), None);
     }
 
     #[test]

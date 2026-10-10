@@ -12,6 +12,9 @@
 #   MACOS_KEYCHAIN        keychain holding the identity (optional)
 # Notarization (env; all three needed, and a real identity):
 #   APPLE_ID, APPLE_PASSWORD (app-specific password), APPLE_TEAM_ID
+# SDK (env):
+#   MACOS_MIN_SDK         fail unless the macOS SDK is at least this major version (release.yml: 26).
+#                         Unset, an SDK older than 26 only warns.
 set -euo pipefail
 # shellcheck source=../env.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
@@ -36,6 +39,20 @@ esac
 
 # Keep in sync with LSMinimumSystemVersion in Info.plist.in.
 export MACOSX_DEPLOYMENT_TARGET=11.0
+
+# macOS 26 and later give an app the current window design (traffic lights, window corners) only
+# when it is linked against the macOS 26 SDK or later; an older SDK gets the old look in
+# compatibility mode. The deployment target above is unaffected.
+SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version 2>/dev/null || true)"
+SDK_MAJOR="${SDK_VERSION%%.*}"
+case "$SDK_MAJOR" in '' | *[!0-9]*) SDK_MAJOR=0 ;; esac
+if [ "$SDK_MAJOR" -lt "${MACOS_MIN_SDK:-26}" ]; then
+  if [ -n "${MACOS_MIN_SDK:-}" ]; then
+    echo "macOS SDK ${SDK_VERSION:-unknown} is older than the required $MACOS_MIN_SDK (select Xcode $MACOS_MIN_SDK or later)" >&2
+    exit 1
+  fi
+  warn "macOS: SDK ${SDK_VERSION:-unknown} is older than 26; macOS 26+ shows the app with the old window design"
+fi
 IDENTITY="${MACOS_SIGN_IDENTITY:--}"
 SHORT_VERSION="${VERSION%%-*}"
 WORK="$CARGO_TARGET_DIR/macos-package"
