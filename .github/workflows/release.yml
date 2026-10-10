@@ -67,9 +67,12 @@ jobs:
   macos:
     name: macOS universal
     needs: version
-    runs-on: macos-15-xlarge  # M2 Pro larger runner; use only in release.yml (actions_macos_xl budget caps spend)
+    # Larger Apple-silicon runner; use only in release.yml (actions_macos_xl budget caps spend).
+    # macOS 26 image: its Xcode 26 SDK gives the app the current macOS window design (package.sh).
+    runs-on: macos-26-xlarge
     environment: release
     env:
+      MACOS_MIN_SDK: "26"
       PHOTOCRAFT_VERSION: ${{ needs.version.outputs.version }}
       PHOTOCRAFT_BUILD_DATE: ${{ needs.version.outputs.date }}
     steps:
