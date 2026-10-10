@@ -1307,7 +1307,7 @@ mod tests {
     #[test]
     fn options_bar_fill_and_stroke_set_the_next_shape() {
         let mut a = app();
-        a.run("layer.new", json!({})).unwrap();
+        a.run("layer.new.layer", json!({})).unwrap();
         let history = a.session.active().unwrap().history.past_len();
         apply_bar_edit(&mut a, BarEdit::Fill("#123456".into())).unwrap();
         apply_bar_edit(&mut a, BarEdit::StrokeColor("#abcdef".into())).unwrap();
@@ -1318,7 +1318,7 @@ mod tests {
             let info = a.run("shape.info", json!({})).unwrap();
             assert_eq!(info["fill"], "#123456", "{tool:?}");
             assert_eq!((info["stroke"]["fill"].clone(), info["stroke"]["width"].clone()), (json!("#abcdef"), json!(4.0)), "{tool:?}");
-            a.run("layer.new", json!({})).unwrap();
+            a.run("layer.new.layer", json!({})).unwrap();
         }
         apply_bar_edit(&mut a, BarEdit::Fill("none".into())).unwrap();
         finish_shape(&mut a, Tool::Rectangle, [10.0, 10.0], [90.0, 90.0], Default::default());
